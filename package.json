@@ -1,0 +1,35 @@
+{
+  "name": "dsh-session-delete",
+  "version": "0.1.0",
+  "description": "在 DeepSeek Harness 侧边栏会话「…」菜单中添加「删除会话」：从工作区注册表摘除并把会话文件移入 ~/.dsh/trash/（可手工恢复）。",
+  "type": "module",
+  "main": "index.js",
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js"
+  },
+  "files": [
+    "index.js",
+    "client.js",
+    "cordis.patch.yml"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-primitives"
+      ],
+      "platform": "web"
+    }
+  },
+  "license": "MIT",
+  "keywords": [
+    "deepseek-harness",
+    "dsh",
+    "dsh-plugin",
+    "session",
+    "delete"
+  ]
+}

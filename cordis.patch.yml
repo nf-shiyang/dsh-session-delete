@@ -1,0 +1,6 @@
+# dsh-session-delete —— DSH bundle patch（挂载声明）
+# 把本插件插入 desktop profile 的插件树，使宿主半 apply() 执行、
+# sessionDelete 远程服务得以注册。
+- insert:
+    - id: dsh-session-delete
+      name: dsh-session-delete
