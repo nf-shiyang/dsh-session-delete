@@ -2,15 +2,18 @@
  * dsh-session-delete — 宿主半（Node / Cordis 插件）
  *
  * 在 Cordis 中注册名为 `sessionDelete` 的远程服务，供客户端半通过
- * Typert 网关调用（POST /api/sessionDelete/delete）。删除一个会话：
+ * Typert 网关调用（POST /api/sessionDelete/delete）。删除一个会话是**永久**的：
  *
  *   1. 仅拦截“真正打开中”的会话：依据 `workspace/session-activity` 瀑布流
  *      （与官方 archiveSession 同一判据），避免把已归档/已关闭会话误判为
- *      “使用中”而拒绝删除（旧版本用 sessions.get 判据，会误杀归档会话）；
+ *      “使用中”而拒绝删除；
  *   2. 从工作区注册表摘除：对存在的每个 workspace 实体 detach、从归档/置顶集合移除；
- *   3. 把 ~/.dsh/sessions/<项目目录>/<sessionId>/ 整目录移入
- *      ~/.dsh/trash/<时间戳>-<sessionId>/（不直接删除，可手工恢复）；
- *   4. 清掉 ~/.dsh/storages/session_projcache/sessions/<sessionId>.json 投影缓存。
+ *   3. 直接 rm -rf `~/.dsh/sessions/<项目目录>/<sessionId>/`（不进回收站，不可恢复）；
+ *   4. 清掉投影缓存 `~/.dsh/storages/session_projcache/sessions/<id>.json`
+ *      （缓存键存在带前缀与不带前缀两种历史写法，两种都删）；
+ *   5. 补发官方 `api-session/removed` 广播 —— 与 `session/disposed` 走同一条
+ *      事件通道（`dsh-api-remotes` 的白名单事件），客户端会话列表据此立刻
+ *      丢掉这一行，不会像仅 detach 那样掉进「未分组」。
  *
  * 零 @deepseek-ai 依赖：typert 绑定与 Remote 方法标记按
  * @deepseek-ai/dsh-typert-protocol 的运行时结构手工构造（网关只认
@@ -32,7 +35,7 @@ const SESSION_ID_PATTERN = /^session-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f
 const REMOTE_METHOD_DESCRIPTOR = '@deepseek-ai/dsh-typert-protocol/remote-methods'
 
 import { join } from 'node:path'
-import { mkdir, readdir, rename, rm, stat } from 'node:fs/promises'
+import { readdir, rm, stat } from 'node:fs/promises'
 import { homedir } from 'node:os'
 
 /** 业务失败返回（与 message-feedback 等 typert 服务的返回惯例一致） */
@@ -50,6 +53,21 @@ function dshHome() {
     return fromEnv.trim()
   }
   return join(homedir(), '.dsh')
+}
+
+/**
+ * 广播「会话已移除」：等价于官方 session/disposed 时发出的那条事件，
+ * 让客户端会话列表立刻丢掉该行（否则只剩 detach，会掉进「未分组」）。
+ * 事件按 cordis 规则冒泡到根，dsh-api-remotes 的白名单订阅会转发给浏览器。
+ */
+function announceRemoved(ctx, sessionId) {
+  try {
+    ctx.emit('api-session/removed', sessionId)
+    return true
+  } catch (error) {
+    ctx.logger?.warn?.(`session-delete: 广播 api-session/removed 失败：${error?.message || error}`)
+    return false
+  }
 }
 
 export function apply(ctx) {
@@ -82,17 +100,19 @@ export function apply(ctx) {
       // 官方 archiveSession 用 `workspace/session-activity` 瀑布流判断活跃度，
       // 而非 sessions.get。sessions 服务对“已归档/已关闭但已知”的会话也会返回
       // 非 undefined，用 sessions.get 会把归档会话误判为“使用中”从而拒绝删除。
+      let open = false
       try {
         const activity = await ctx.waterfall(
           'workspace/session-activity',
           { sessionId },
           () => Promise.resolve([]),
         )
-        if (Array.isArray(activity) && activity.length > 0) {
-          return fail('session-open', '该会话正在使用中，请先关闭/切换到其他会话再删除。')
-        }
+        open = Array.isArray(activity) && activity.length > 0
       } catch {
-        // 拿不到活动信息时放行，不误杀（绝不能用 sessions.get 兜底拦截）
+        // 拿不到活动信息时放行，不误杀
+      }
+      if (open) {
+        return fail('session-open', '该会话正在使用中，请先切换到其他会话再删除。')
       }
 
       // —— 2. 工作区注册表摘除 ——
@@ -104,11 +124,7 @@ export function apply(ctx) {
         ctx.logger?.warn?.(`session-delete: sessionKnown 失败：${e?.message || e}`)
         return false
       })
-      if (!known) {
-        return fail('not-found', '未找到该会话（可能已删除）。')
-      }
 
-      // 从每个工作区实体摘除（没有工作区时 list() 返回空数组，自动跳过）
       for (const workspace of registry.list()) {
         try {
           await workspace.detachSession(sessionId)
@@ -127,12 +143,10 @@ export function apply(ctx) {
         ctx.logger?.warn?.(`session-delete: unpinSession 失败：${e?.message || e}`)
       }
 
-      // —— 3. 会话文件移入回收站目录（不直接删除，可恢复） ——
+      // —— 3. 永久删除会话数据目录 ——
       const home = dshHome()
       const sessionsRoot = join(home, 'sessions')
-      const stamp = new Date().toISOString().replace(/[:.]/g, '-')
-      const trashDir = join(home, 'trash', `${stamp}-${sessionId}`)
-      const moved = []
+      const removed = []
       let groups = []
       try {
         groups = await readdir(sessionsRoot)
@@ -144,24 +158,34 @@ export function apply(ctx) {
         try {
           const info = await stat(source)
           if (!info.isDirectory()) continue
-          await mkdir(join(trashDir, group), { recursive: true })
-          await rename(source, join(trashDir, group, sessionId))
-          moved.push(source)
+          await rm(source, { recursive: true, force: true })
+          removed.push(source)
         } catch (e) {
           if (e && e.code !== 'ENOENT') {
-            ctx.logger?.warn?.(`session-delete: 移动 ${source} 失败：${e?.message || e}`)
+            ctx.logger?.warn?.(`session-delete: 删除 ${source} 失败：${e?.message || e}`)
           }
         }
       }
 
-      // —— 4. 投影缓存清理（小文件，直接删） ——
-      const projectionCache = join(home, 'storages', 'session_projcache', 'sessions', `${sessionId}.json`)
-      await rm(projectionCache, { force: true }).catch(() => {})
+      // —— 4. 投影缓存清理（历史上有带前缀 / 不带前缀两种键） ——
+      const cacheDir = join(home, 'storages', 'session_projcache', 'sessions')
+      const bareId = sessionId.replace(/^session-/, '')
+      for (const key of new Set([sessionId, bareId])) {
+        await rm(join(cacheDir, `${key}.json`), { force: true }).catch(() => {})
+      }
+
+      // 文件确实一个都没删掉、注册表里也不认识它 → 真的不存在
+      if (!known && removed.length === 0) {
+        return fail('not-found', '未找到该会话（可能已删除）。')
+      }
+
+      // —— 5. 让界面立刻丢掉这一行 ——
+      announceRemoved(ctx, sessionId)
 
       ctx.logger?.info?.(
-        `session-delete: 会话 ${sessionId} 已摘除（${moved.length} 个数据目录移入回收站 ${trashDir}）。`,
+        `session-delete: 会话 ${sessionId} 已永久删除（${removed.length} 个数据目录）。`,
       )
-      return { ok: true, value: { deleted: true, moved } }
+      return { ok: true, value: { deleted: true, removed } }
     } catch (e) {
       return fail('internal', e instanceof Error ? e.message : String(e))
     }

@@ -1,7 +1,7 @@
 {
   "name": "dsh-session-delete",
-  "version": "0.1.0",
-  "description": "在 DeepSeek Harness 侧边栏会话「…」菜单中添加「删除会话」：从工作区注册表摘除并把会话文件移入 ~/.dsh/trash/（可手工恢复）。",
+  "version": "0.2.1",
+  "description": "在 DeepSeek Harness 侧边栏会话「…」菜单中添加「删除会话」：弹出确认框后永久删除该会话的全部数据（不进回收站，不可恢复）。",
   "type": "module",
   "main": "index.js",
   "exports": {
